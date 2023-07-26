@@ -1,0 +1,168 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant-cluster
+  namespace: qdrant-cluster
+spec:
+  type: LoadBalancer
+  selector:
+    app: qdrant-cluster
+  ports:
+    - name: http
+      port: 6333
+      protocol: TCP
+    - name: grpc
+      port: 6334
+      protocol: TCP
+    - name: raft
+      port: 6335
+      protocol: TCP
+    - name: oauth-proxy
+      port: 80
+      targetPort: 4180
+      protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: qdrant-cluster
+  namespace: qdrant-cluster
+spec:
+  serviceName: qdrant-cluster
+  replicas: 2
+  selector:
+    matchLabels:
+      app: qdrant-cluster
+  template:
+    metadata:
+      labels:
+        app: qdrant-cluster
+    spec:
+      volumes:
+        - name: qdrant-cluster-script-volume
+          configMap:
+            name: qdrant-cluster-script-config
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:latest
+          ports:
+          - containerPort: 4180
+          args:
+          - --provider=github
+          - --email-domain=*
+          - --cookie-domain=[insert endpoint fqdn]
+          - --whitelist-domain=*.[insert endpoint fqdn]
+          - --upstream=http://localhost:6333/
+          - --cookie-secure=false
+          - --cookie-expire=168h0m
+          - --cookie-refresh=60m
+          - --cookie-secret=[insert cookie secret]
+          - --redirect-url=[insert endpoint/oauth2/callback]
+          env:
+          - name: OAUTH2_PROXY_CLIENT_ID
+            valueFrom:
+              secretKeyRef:
+                name: qdrant-cluster-oauth-secrets
+                key: client-id
+          - name: OAUTH2_PROXY_CLIENT_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: qdrant-cluster-oauth-secrets
+                key: client-secret
+        - name: qdrant
+          image: qdrant/qdrant:latest
+          env:
+            - name: QDRANT__CLUSTER__ENABLED
+              value: "true"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+            requests:
+              cpu: 1000m
+              memory: 1Gi
+          ports:
+            - containerPort: 6333
+            - containerPort: 6334
+            - containerPort: 6335
+          volumeMounts:
+            - name: qdrant-cluster-qdrant-data
+              mountPath: /data
+            - name: qdrant-cluster-script-volume
+              mountPath: /scripts
+          command: ["/bin/bash"]
+          args: ["-c", "cp /scripts/start.sh ./start.sh && chmod +x start.sh && bash start.sh"]
+  volumeClaimTemplates:
+  - metadata:
+      name: qdrant-cluster-qdrant-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qdrant-cluster-script-config
+  namespace: qdrant-cluster
+data:
+  start.sh: |
+    #!/bin/bash
+    echo ${POD_NAME}
+    SS_NAME=$(echo ${POD_NAME} | cut -d "-" -f 1)-$(echo ${POD_NAME} | cut -d "-" -f 2)
+    pod_name_check=$(echo ${POD_NAME} | grep 0)
+    if [ ! -z "${pod_name_check}" ]; then 
+      ./qdrant --uri "http://${POD_NAME}.${SS_NAME}.${POD_NAMESPACE}.svc.cluster.local:6335"
+    else
+      ./qdrant --bootstrap "http://${SS_NAME}-0.${SS_NAME}.${POD_NAMESPACE}.svc.cluster.local:6335"
+    fi
+
+---
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: qdrant-cluster-autoscaler
+  namespace: qdrant-cluster
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: qdrant-cluster
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 50
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: qdrant-cluster-oauth-secrets
+  namespace: qdrant-cluster
+type: Opaque
+stringData:
+  client-secret: ""
+  client-id: ""
